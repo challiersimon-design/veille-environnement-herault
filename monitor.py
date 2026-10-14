@@ -87,10 +87,16 @@ def email_alert(items):
 
 def main():
     # Fail BEFORE changing state if API down or malformed.
-    info = get(API + '?limit=1')
-    print('TOTAL DOSSIERS :', info.get('total_count'))
-    print('CHAMPS DISPONIBLES :', list(info.get('results', [{}])[0].keys()))
-    print('PREMIER DOSSIER :', json.dumps(info.get('results', [{}])[0], ensure_ascii=False)[:3000])
+    info = get(API + '?limit=100')
+    print('TOTAL :', info.get('total_count'))
+    for r in info.get('results', [])[:10]:
+        print(json.dumps({
+            'titre': r.get('dc_title'),
+            'localisation': r.get('dc_location'),
+            'ville': r.get('location_ville'),
+            'couverture': r.get('dc_coverage'),
+            'coordonnees': r.get('geo_point_2d')
+        }, ensure_ascii=False))
     return
     if not rows: raise RuntimeError('API returned no records; refusing to claim zero new files')
     matched=[convert(r) for r in rows if selected(r)]
