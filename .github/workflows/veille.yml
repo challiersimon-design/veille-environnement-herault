@@ -1,0 +1,49 @@
+
+name: Veille Hérault
+
+on:
+  schedule:
+    - cron: '0 8,9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check Paris local hour
+        id: time
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          import os
+          print('run='+str(os.environ['EVENT']=='workflow_dispatch' or datetime.now(ZoneInfo('Europe/Paris')).hour==10).lower())
+          PY
+
+      - name: Fetch, build RSS, optionally email
+        if: steps.time.outputs.run == 'true'
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+        run: python monitor.py
+
+      - name: Commit feed and state
+        if: steps.time.outputs.run == 'true'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add state.json docs/herault.xml
+          git diff --cached --quiet || (git commit -m 'Update Hérault RSS' && git push)
