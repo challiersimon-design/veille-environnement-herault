@@ -1,0 +1,119 @@
+name: Diagnostic export NOVAe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Installer navigateur
+        run: |
+          python -m pip install playwright openpyxl
+          python -m playwright install --with-deps chromium
+
+      - name: Tester Exporter tout sur NOVAe Occitanie
+        run: |
+          cat > /tmp/export_novae.py <<'PY'
+          import asyncio, json, re, csv, io, zipfile
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+
+          URL = 'https://evaluation-environnementale.ecologie.gouv.fr/#/public/portalReviews?place=Occitanie'
+          OUT = Path('/tmp/novae_diagnostic')
+          OUT.mkdir(exist_ok=True)
+
+          def analyse(path):
+              import openpyxl
+              b = path.read_bytes()
+              print('EXPORT_OCTETS:', len(b))
+              print('EXPORT_FORMAT:', path.suffix.lower(), 'MAGIC:', repr(b[:12]))
+              try:
+                  if b[:2] == b'PK':
+                      wb = openpyxl.load_workbook(io.BytesIO(b), read_only=True, data_only=True)
+                      print('EXCEL_FEUILLES:', wb.sheetnames)
+                      for ws in wb.worksheets:
+                          rows = ws.iter_rows(values_only=True)
+                          headers = next(rows, ())
+                          print('EXCEL_COLONNES:', [str(x)[:100] for x in headers])
+                          count = 0; samples = []
+                          for row in rows:
+                              count += 1
+                              s = ' '.join(str(x or '') for x in row)
+                              if re.search(r'(?<!\d)34\s*[-–—]\s*H[ée]rault\b|\bH[ée]rault\b', s, re.I) and len(samples) < 3:
+                                  samples.append(s[:350])
+                          print('EXCEL_LIGNES:', count, 'ECHANTILLONS_34:', samples)
+                  elif b[:1] in (b'{', b'['):
+                      obj = json.loads(b)
+                      print('JSON_TYPE:', type(obj).__name__)
+                      print('JSON_KEYS:', list(obj)[:30] if isinstance(obj, dict) else 'liste '+str(len(obj)))
+                  else:
+                      content = b.decode('utf-8-sig', errors='replace')
+                      sniffer = csv.Sniffer()
+                      dialect = sniffer.sniff(content[:5000], delimiters=',;\t|')
+                      reader = csv.reader(io.StringIO(content), dialect)
+                      headers = next(reader, [])
+                      count = 0; samples = []
+                      for row in reader:
+                          count += 1
+                          s = ' '.join(row)
+                          if re.search(r'(?<!\d)34\s*[-–—]\s*H[ée]rault\b|\bH[ée]rault\b', s, re.I) and len(samples) < 3:
+                              samples.append(s[:350])
+                      print('CSV_COLONNES:', headers)
+                      print('CSV_LIGNES:', count, 'ECHANTILLONS_34:', samples)
+              except Exception as exc:
+                  print('ANALYSE_INCOMPLETE:', type(exc).__name__, str(exc)[:250])
+
+          async def main():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  page = await browser.new_page(locale='fr-FR', accept_downloads=True)
+                  async def log_response(r):
+                      try:
+                          if 'evaluation-environnementale.ecologie.gouv.fr' in r.url and ('export' in r.url.lower() or 'download' in r.url.lower()):
+                              print('REQUETE_EXPORT:', r.status, r.url.split('?')[0][:200], r.headers.get('content-type',''))
+                      except Exception: pass
+                  page.on('response', lambda r: asyncio.create_task(log_response(r)))
+                  await page.goto(URL, wait_until='domcontentloaded', timeout=45000)
+                  await page.wait_for_timeout(12000)
+                  print('ADRESSE:', page.url)
+                  print('TITRE:', await page.title())
+                  button = page.get_by_text(re.compile(r'Exporter tout\s*\(', re.I)).first
+                  print('BOUTON_EXPORT_TOUT_TROUVE:', await button.count())
+                  if not await button.count():
+                      print('ERREUR: commande Exporter tout introuvable; aucun export validé')
+                      await browser.close()
+                      raise RuntimeError('Bouton Exporter tout introuvable')
+                  try:
+                      async with page.expect_download(timeout=25000) as d:
+                          await button.click(timeout=10000)
+                      download = await d.value
+                      print('TELECHARGEMENT:', download.suggested_filename)
+                      destination = OUT / ('export'+Path(download.suggested_filename).suffix.lower())
+                      await download.save_as(destination)
+                      analyse(destination)
+                      # On ne publie PAS l'export dans les artefacts: seulement ce diagnostic de structure.
+                      destination.unlink()
+                  except Exception as exc:
+                      print('PAS_DE_TELECHARGEMENT_DIRECT:', type(exc).__name__, str(exc)[:250])
+                      print('TEXTE_APRES_CLIC:', (await page.locator('body').inner_text())[-3500:])
+                      print('BOUTONS_VISIBLE:', await page.get_by_role('button').all_inner_texts())
+                      await page.screenshot(path=str(OUT/'apres_export.png'), full_page=False)
+                      raise RuntimeError('Export non confirme: inspection necessaire') from exc
+                  finally:
+                      await browser.close()
+          asyncio.run(main())
+          PY
+          python /tmp/export_novae.py
+
+      - name: Joindre capture en cas d'echec
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-export-novae
+          path: /tmp/novae_diagnostic/apres_export.png
+          if-no-files-found: ignore
