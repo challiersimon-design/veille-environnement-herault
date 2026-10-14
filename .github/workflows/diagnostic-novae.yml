@@ -1,0 +1,61 @@
+name: Diagnostic portail NOVAe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Installer Playwright
+        run: |
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Tester le portail officiel (Occitanie)
+        run: |
+          cat > /tmp/test_novae.py <<'PY'
+          import asyncio, json
+          from urllib.parse import urlsplit
+          from playwright.async_api import async_playwright
+
+          URL = 'https://evaluation-environnementale.ecologie.gouv.fr/#/public/portalReviews?place=Occitanie'
+          async def main():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  page = await browser.new_page(locale='fr-FR', viewport={'width': 1440, 'height': 900})
+                  detected = []
+                  async def inspect(response):
+                      try:
+                          u=urlsplit(response.url)
+                          ct=response.headers.get('content-type','')
+                          if 'json' not in ct.lower(): return
+                          if not (u.hostname or '').endswith('ecologie.gouv.fr'): return
+                          obj=await response.json()
+                          if isinstance(obj,dict):
+                              keys=list(obj)[:35]
+                              shape={k:(f'list({len(v)})' if isinstance(v,list) else type(v).__name__) for k,v in list(obj.items())[:20]}
+                          elif isinstance(obj,list):
+                              keys=['<array>']; shape={'length':len(obj),'first_item_keys':list(obj[0])[:20] if obj and isinstance(obj[0],dict) else []}
+                          else: keys=[];shape={}
+                          detected.append({'host':u.hostname,'path':u.path,'status':response.status,'keys':keys,'shape':shape})
+                      except Exception: pass
+                  page.on('response', lambda r: asyncio.create_task(inspect(r)))
+                  try:
+                      await page.goto(URL, wait_until='domcontentloaded', timeout=45000)
+                      await page.wait_for_timeout(15000)
+                      text=await page.locator('body').inner_text(timeout=10000)
+                      print('FINAL_URL:',page.url)
+                      print('PAGE_TITLE:',await page.title())
+                      print('VISIBLE_TEXT_START:',text[:6000])
+                      print('API_JSON_RESPONSES:',json.dumps(detected[:50],ensure_ascii=False,indent=2))
+                      print('API_COUNT:',len(detected))
+                  finally:
+                      await browser.close()
+          asyncio.run(main())
+          PY
+          python /tmp/test_novae.py
