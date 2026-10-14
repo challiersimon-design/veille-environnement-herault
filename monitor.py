@@ -87,7 +87,11 @@ def email_alert(items):
 
 def main():
     # Fail BEFORE changing state if API down or malformed.
-    rows=list(records())
+    info = get(API + '?limit=1')
+    print('TOTAL DOSSIERS :', info.get('total_count'))
+    print('CHAMPS DISPONIBLES :', list(info.get('results', [{}])[0].keys()))
+    print('PREMIER DOSSIER :', json.dumps(info.get('results', [{}])[0], ensure_ascii=False)[:3000])
+    return
     if not rows: raise RuntimeError('API returned no records; refusing to claim zero new files')
     matched=[convert(r) for r in rows if selected(r)]
     if not matched: raise RuntimeError('No 34 records found: check schema, cannot infer no updates')
