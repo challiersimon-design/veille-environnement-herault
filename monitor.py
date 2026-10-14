@@ -13,7 +13,7 @@ ROOT=Path(__file__).parent
 STATE=ROOT/'state.json'
 FEED=ROOT/'docs'/'herault.xml'
 LIMIT=100
-MAX_PAGES=50
+MAX_PAGES=70
 
 def get(url):
     req=urllib.request.Request(url,headers={'User-Agent':'JournalistEnvironmentWatch/1.0 (+public data)','Accept':'application/json'})
@@ -35,17 +35,16 @@ def records():
 def norm(s):
     return re.sub(r'\s+',' ',str(s or '')).strip()
 
+
 def selected(row):
-    f=row.get('fields',row)
-    if not isinstance(f,dict): return False
-    # Strict departmental markers rather than brittle keyword matching.
-    keys=[k for k in f if any(w in k.lower() for w in ('departement','département'))]
-    for k in keys:
-        val=f[k]
-        if isinstance(val,list): val=' '.join(map(str,val))
-        v=norm(val).lower()
-        if re.search(r'(^|\D)34(\D|$)',v) or 'hérault' in v or 'herault' in v: return True
-    return False
+    f = row.get('fields', row)
+    if not isinstance(f, dict):
+        return False
+    location = norm(f.get('dc_location')).lower()
+    return bool(re.search(
+        r'(?<!\d)34\s*[-–—]\s*h[ée]rault\b',
+        location
+    ))
 
 def first(f,*names):
     for name in names:
@@ -87,17 +86,9 @@ def email_alert(items):
 
 def main():
     # Fail BEFORE changing state if API down or malformed.
-    info = get(API + '?limit=100')
-    print('TOTAL :', info.get('total_count'))
-    for r in info.get('results', [])[:10]:
-        print(json.dumps({
-            'titre': r.get('dc_title'),
-            'localisation': r.get('dc_location'),
-            'ville': r.get('location_ville'),
-            'couverture': r.get('dc_coverage'),
-            'coordonnees': r.get('geo_point_2d')
-        }, ensure_ascii=False))
-    return
+    
+    rows = list(records())
+
     if not rows: raise RuntimeError('API returned no records; refusing to claim zero new files')
     matched=[convert(r) for r in rows if selected(r)]
     if not matched: raise RuntimeError('No 34 records found: check schema, cannot infer no updates')
