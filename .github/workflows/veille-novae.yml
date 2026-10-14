@@ -1,0 +1,203 @@
+name: Veille NOVAe Hérault 34
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 8,9 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: veille-novae-34
+  cancel-in-progress: false
+
+jobs:
+  surveiller:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Contrôler heure française
+        id: horaire
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          hour = datetime.now(ZoneInfo('Europe/Paris')).hour
+          print('execute='+str(os.environ['EVENT_NAME']=='workflow_dispatch' or hour==10).lower())
+          PY
+      - name: Installer navigateur et lecteur Excel
+        if: steps.horaire.outputs.execute == 'true'
+        run: |
+          python -m pip install playwright openpyxl
+          python -m playwright install --with-deps chromium
+      - name: Vérifier les nouvelles publications officielles du 34
+        if: steps.horaire.outputs.execute == 'true'
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+        run: |
+          cat > /tmp/veille_novae.py <<'PY'
+          import asyncio, io, json, os, re, ssl, smtplib, hashlib
+          from pathlib import Path
+          from datetime import datetime, date, timezone
+          from email.message import EmailMessage
+          from email.utils import format_datetime
+          from xml.etree.ElementTree import Element, SubElement, ElementTree
+          from openpyxl import load_workbook
+          from playwright.async_api import async_playwright
+
+          URL = 'https://evaluation-environnementale.ecologie.gouv.fr/#/public/portalReviews?place=Occitanie'
+          STATE = Path('novae-34-state.json')
+          FEED = Path('docs/novae-herault.xml')
+          HEADERS = ['Date de publication','Numéro de la demande','Intitulé de la demande','Commune','Région','Territoire concerné']
+
+          def clean(value):
+              return ' '.join(str(value or '').split())
+
+          def is_herault(row):
+              # Ne pas utiliser le descriptif libre pour éviter les mentions incidentes du 34.
+              territory=clean(row.get('Territoire concerné')).lower()
+              communes=clean(row.get('Commune')).lower()
+              return bool(re.search(r'(?<!\d)34\s*[-–—]\s*h[ée]rault\b', territory) or
+                          re.search(r'\(\s*34\s*\)', communes) or
+                          re.search(r'\b34\s*[-–—]\s*h[ée]rault\b', communes))
+
+          def date_value(value):
+              if isinstance(value,datetime): return value.replace(tzinfo=timezone.utc)
+              if isinstance(value,date): return datetime(value.year,value.month,value.day,tzinfo=timezone.utc)
+              s=clean(value)
+              for fmt in ('%d-%m-%Y','%d/%m/%Y','%Y-%m-%d','%Y-%m-%d %H:%M:%S'):
+                  try: return datetime.strptime(s,fmt).replace(tzinfo=timezone.utc)
+                  except ValueError: pass
+              raise ValueError('Date de publication inattendue: '+repr(s))
+
+          async def export():
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch(headless=True)
+                  try:
+                      page=await browser.new_page(locale='fr-FR',accept_downloads=True)
+                      await page.goto(URL,wait_until='domcontentloaded',timeout=45000)
+                      await page.wait_for_timeout(12000)
+                      button=page.get_by_text(re.compile(r'Exporter tout\s*\(',re.I)).first
+                      if await button.count()!=1: raise RuntimeError('Commande Exporter tout introuvable')
+                      async with page.expect_download(timeout=30000) as pending:
+                          await button.click(timeout=10000)
+                      download=await pending.value
+                      if not download.suggested_filename.lower().endswith('.xlsx'):
+                          raise RuntimeError('Export non XLSX: '+download.suggested_filename)
+                      path=Path('/tmp/novae34-export.xlsx')
+                      await download.save_as(path)
+                      data=path.read_bytes()
+                      if not data.startswith(b'PK'): raise RuntimeError('Export Excel non valide')
+                      return data
+                  finally:
+                      await browser.close()
+
+          def parse_xlsx(raw):
+              wb=load_workbook(io.BytesIO(raw),read_only=True,data_only=True)
+              try:
+                  result=[]; count=0; valid_sheet=False
+                  for ws in wb.worksheets:
+                      iterator=ws.iter_rows(values_only=True)
+                      columns=[clean(x) for x in next(iterator,())]
+                      if not all(col in columns for col in HEADERS): continue
+                      valid_sheet=True
+                      for rawrow in iterator:
+                          if not any(x is not None for x in rawrow): continue
+                          count+=1
+                          row=dict(zip(columns,rawrow))
+                          if not is_herault(row): continue
+                          number=clean(row['Numéro de la demande'])
+                          title=clean(row['Intitulé de la demande'])
+                          publication=date_value(row['Date de publication'])
+                          if not number or not title: raise RuntimeError('Dossier 34 sans numéro ou intitulé')
+                          # L'identité d'un dossier est stable à travers une simple mise à jour de ses autres champs.
+                          identity=hashlib.sha256((number+'|'+title).casefold().encode()).hexdigest()[:24]
+                          result.append({'id':identity,'number':number,'title':title,
+                              'date':publication.strftime('%Y-%m-%d'),
+                              'commune':clean(row.get('Commune')),
+                              'territoire':clean(row.get('Territoire concerné')),
+                              'procedure':clean(row.get('Type de procédure')),
+                              'authority':clean(row.get('Autorité'))})
+                  if not valid_sheet: raise RuntimeError('Colonnes NOVAe requises absentes')
+                  if count<100: raise RuntimeError(f'Export incomplet ou anormal: {count} lignes')
+                  if not result: raise RuntimeError('Aucun dossier Hérault: filtre ou export à examiner')
+                  unique={r['id']:r for r in result}
+                  print(f'Export NOVAe: {count} lignes, {len(unique)} dossiers 34 distincts')
+                  return list(unique.values())
+              finally: wb.close()
+
+          def make_rss(entries):
+              FEED.parent.mkdir(parents=True,exist_ok=True)
+              rss=Element('rss',version='2.0'); channel=SubElement(rss,'channel')
+              for name,value in [('title','NOVAe — nouvelles publications environnementales — Hérault 34'),
+                                 ('link',URL),('description','Dossiers du 34 publiés sur le portail officiel NOVAe (Occitanie).'),
+                                 ('language','fr-fr'),('lastBuildDate',format_datetime(datetime.now(timezone.utc)))]:
+                  SubElement(channel,name).text=value
+              for entry in sorted(entries,key=lambda r:(r['date'],r['number']),reverse=True)[:300]:
+                  item=SubElement(channel,'item')
+                  for name,value in [('title',entry['title']),('link',URL),('guid',entry['id']),
+                                     ('description',f"{entry['date']} | {entry['number']} | {entry['commune']} | {entry['territoire']} | {entry['procedure']}")]:
+                      SubElement(item,name).text=value
+                  dt=datetime.strptime(entry['date'],'%Y-%m-%d').replace(tzinfo=timezone.utc)
+                  SubElement(item,'pubDate').text=format_datetime(dt)
+              ElementTree(rss).write(FEED,encoding='utf-8',xml_declaration=True)
+
+          def notify(fresh):
+              missing=[v for v in ('SMTP_HOST','SMTP_USER','SMTP_PASSWORD','ALERT_TO') if not os.getenv(v)]
+              if missing: raise RuntimeError('Secrets Gmail manquants: '+', '.join(missing))
+              msg=EmailMessage()
+              msg['Subject']=f'NOVAe Hérault (34) — {len(fresh)} nouveau(x) dossier(s)'
+              msg['From']=os.environ['SMTP_USER'];msg['To']=os.environ['ALERT_TO']
+              lines=[]
+              for r in fresh:
+                  lines.append(f"{r['date']} — {r['title']}\nRéférence : {r['number']}\nCommune : {r['commune']}\nTerritoire : {r['territoire']}\nProcédure : {r['procedure']}\n{URL}")
+              msg.set_content('\n\n'.join(lines))
+              with smtplib.SMTP_SSL(os.environ['SMTP_HOST'],int(os.getenv('SMTP_PORT','465')),timeout=30,context=ssl.create_default_context()) as smtp:
+                  smtp.login(os.environ['SMTP_USER'],os.environ['SMTP_PASSWORD'])
+                  smtp.send_message(msg)
+
+          async def main():
+              current=parse_xlsx(await export())
+              old=json.loads(STATE.read_text()) if STATE.exists() else None
+              seen=set(old.get('seen',[])) if old else set()
+              fresh=[r for r in current if r['id'] not in seen]
+              # Éviter une avalanche d'alertes historiques lors du premier contrôle.
+              if old is None:
+                  print(f'Initialisation: {len(current)} dossiers 34 mémorisés, aucun e-mail historique')
+              elif fresh:
+                  notify(fresh)  # En cas d'échec du SMTP, ne pas enregistrer les nouveaux identifiants.
+                  print(f'{len(fresh)} nouveaux dossiers NOVAe 34: email envoyé')
+              else:
+                  print('Aucun nouveau dossier NOVAe 34, pas de message envoyé')
+              previous=old.get('items',[]) if old else []
+              combined={r['id']:r for r in previous}
+              combined.update({r['id']:r for r in current})
+              make_rss(list(combined.values()))
+              STATE.write_text(json.dumps({'seen':sorted(seen|{r['id'] for r in current}),
+                                           'items':list(combined.values())},ensure_ascii=False,indent=2))
+
+          asyncio.run(main())
+          PY
+          python /tmp/veille_novae.py
+      - name: Enregistrer historique et flux NOVAe
+        if: steps.horaire.outputs.execute == 'true'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add novae-34-state.json docs/novae-herault.xml
+          if ! git diff --cached --quiet; then
+            git commit -m 'Actualiser la veille NOVAe du 34'
+            git push
+          fi
